@@ -110,6 +110,7 @@ static JSContext *JS_NewCustomContext(JSRuntime *rt)
     /* system modules */
     js_init_module_std(ctx, "std");
     js_init_module_os(ctx, "os");
+    js_init_module_xmlhttprequest(ctx, "xhr");
     return ctx;
 }
 

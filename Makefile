@@ -22,6 +22,15 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 
+
+PKG_CONFIG ?= pkg-config
+CURL_PKG   ?= libcurl
+
+ifeq ($(shell $(PKG_CONFIG) --exists $(CURL_PKG) && echo yes),yes)
+  CURL_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(CURL_PKG))
+  CURL_LIBS   := $(shell $(PKG_CONFIG) --libs   $(CURL_PKG))
+endif
+
 ifeq ($(shell uname -s),Darwin)
 CONFIG_DARWIN=y
 endif
@@ -239,7 +248,7 @@ endif
 
 all: $(OBJDIR) $(OBJDIR)/quickjs.check.o $(OBJDIR)/qjs.check.o $(PROGS)
 
-QJS_LIB_OBJS=$(OBJDIR)/quickjs.o $(OBJDIR)/dtoa.o $(OBJDIR)/libregexp.o $(OBJDIR)/libunicode.o $(OBJDIR)/cutils.o $(OBJDIR)/quickjs-libc.o
+QJS_LIB_OBJS=$(OBJDIR)/quickjs.o $(OBJDIR)/dtoa.o $(OBJDIR)/libregexp.o $(OBJDIR)/libunicode.o $(OBJDIR)/cutils.o $(OBJDIR)/quickjs-libc.o  $(OBJDIR)/xhr.o
 
 QJS_OBJS=$(OBJDIR)/qjs.o $(OBJDIR)/repl.o $(QJS_LIB_OBJS)
 
@@ -249,7 +258,8 @@ ifndef CONFIG_WIN32
 LIBS+=-ldl
 endif
 LIBS+=$(EXTRA_LIBS)
-
+CFLAGS+= $(CURL_CFLAGS)
+LIBS+= $(CURL_LIBS)
 $(OBJDIR):
 	mkdir -p $(OBJDIR) $(OBJDIR)/examples $(OBJDIR)/tests
 

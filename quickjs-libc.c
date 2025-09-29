@@ -37,6 +37,7 @@
 #include <limits.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include "curl-utils.h"
 #if defined(_WIN32)
 #include <windows.h>
 #include <conio.h>
@@ -84,11 +85,13 @@ typedef sig_t sighandler_t;
    - add socket calls
 */
 
+
 typedef struct {
     struct list_head link;
     int fd;
     JSValue rw_func[2];
 } JSOSRWHandler;
+
 
 typedef struct {
     struct list_head link;
@@ -148,14 +151,31 @@ typedef struct JSThreadState {
     struct list_head os_timers; /* list of JSOSTimer.link */
     struct list_head port_list; /* list of JSWorkerMessageHandler.link */
     struct list_head rejected_promise_list; /* list of JSRejectedPromiseEntry.link */
+    struct list_head curl_events; /* list of JSOSTimer.link */
     int eval_script_recurse; /* only used in the main thread */
     int next_timer_id; /* for setTimeout() */
     /* not used in the main thread */
     JSWorkerMessagePipe *recv_pipe, *send_pipe;
+    CURLM *curlm_h;
+
 } JSThreadState;
+
+typedef void (*event_cb)(int fd,uint8_t is_read,uint8_t is_write, void *arg);
+typedef struct {
+    struct list_head link;
+    int fd;
+    uint8_t is_read;
+    uint8_t is_write;
+    void *arg;
+    event_cb cb;
+    JSThreadState *qrt;
+    //JSValue timer_func;
+}
+JSCURLRWHandler;
 
 static uint64_t os_pending_signals;
 static int (*os_poll_func)(JSContext *ctx);
+
 
 static void js_std_dbuf_init(JSContext *ctx, DynBuf *s)
 {
@@ -1993,6 +2013,11 @@ static JSOSRWHandler *find_rh(JSThreadState *ts, int fd)
     }
     return NULL;
 }
+static void free_curl_handler(JSRuntime *rt, JSCURLRWHandler *rh)
+{
+    list_del(&rh->link);
+    js_free_rt(rt, rh);
+}
 
 static void free_rw_handler(JSRuntime *rt, JSOSRWHandler *rh)
 {
@@ -2577,6 +2602,16 @@ static int js_os_poll(JSContext *ctx)
             FD_SET(rh->fd, &wfds);
     }
 
+    list_for_each(el, &ts->curl_events) {
+        JSCURLRWHandler *curl_rh= list_entry(el, JSCURLRWHandler, link);
+        fd_max = max_int(fd_max, curl_rh->fd);
+        if (curl_rh->is_read == 1)
+            FD_SET(curl_rh->fd, &rfds);
+        if (curl_rh->is_write == 1)
+            FD_SET(curl_rh->fd, &wfds);
+    }
+
+
     list_for_each(el, &ts->port_list) {
         JSWorkerMessageHandler *port = list_entry(el, JSWorkerMessageHandler, link);
         if (!JS_IsNull(port->on_message_func)) {
@@ -2599,6 +2634,24 @@ static int js_os_poll(JSContext *ctx)
             if (!JS_IsNull(rh->rw_func[1]) &&
                 FD_ISSET(rh->fd, &wfds)) {
                 call_handler(ctx, rh->rw_func[1]);
+                /* must stop because the list may have been modified */
+                goto done;
+            }
+        }
+
+        list_for_each(el, &ts->curl_events) {
+            JSCURLRWHandler *curl_rh = list_entry(el, JSCURLRWHandler, link);
+            if ((curl_rh->is_read ==1) &&
+                FD_ISSET(curl_rh->fd, &rfds)) {
+                curl_rh->cb(curl_rh->fd,curl_rh->is_read,0,curl_rh->arg);
+                //call_handler(ctx, rh->rw_func[0]);
+                /* must stop because the list may have been modified */
+                goto done;
+            }
+            if ((curl_rh->is_write ==1) &&
+                FD_ISSET(curl_rh->fd, &wfds)) {
+                curl_rh->cb(curl_rh->fd,0,curl_rh->is_write,curl_rh->arg);
+                //call_handler(ctx, rh->rw_func[1]);
                 /* must stop because the list may have been modified */
                 goto done;
             }
@@ -4094,10 +4147,11 @@ void js_std_init_handlers(JSRuntime *rt)
     init_list_head(&ts->os_timers);
     init_list_head(&ts->port_list);
     init_list_head(&ts->rejected_promise_list);
+    init_list_head(&ts->curl_events);
     ts->next_timer_id = 1;
-
+    ts->curlm_h = NULL;
     JS_SetRuntimeOpaque(rt, ts);
-
+    curl_global_init(CURL_GLOBAL_ALL);
 #ifdef USE_WORKER
     /* set the SharedArrayBuffer memory handlers */
     {
@@ -4116,9 +4170,19 @@ void js_std_free_handlers(JSRuntime *rt)
     JSThreadState *ts = JS_GetRuntimeOpaque(rt);
     struct list_head *el, *el1;
 
+    if (ts->curlm_h) {
+        curl_multi_cleanup(ts->curlm_h);
+        ts->curlm_h = NULL;
+    }
+
     list_for_each_safe(el, el1, &ts->os_rw_handlers) {
         JSOSRWHandler *rh = list_entry(el, JSOSRWHandler, link);
         free_rw_handler(rt, rh);
+    }
+
+    list_for_each_safe(el, el1, &ts->curl_events) {
+        JSCURLRWHandler *rh = list_entry(el, JSCURLRWHandler, link);
+        free_curl_handler(rt, rh);
     }
 
     list_for_each_safe(el, el1, &ts->os_signal_handlers) {
@@ -4143,7 +4207,7 @@ void js_std_free_handlers(JSRuntime *rt)
     js_free_message_pipe(ts->recv_pipe);
     js_free_message_pipe(ts->send_pipe);
 #endif
-
+    curl_global_cleanup();
     free(ts);
     JS_SetRuntimeOpaque(rt, NULL); /* fail safe */
 }
@@ -4320,6 +4384,242 @@ void js_std_eval_binary(JSContext *ctx, const uint8_t *buf, size_t buf_len,
         }
         JS_FreeValue(ctx, val);
     }
+}
+
+CURL *tjs__curl_easy_init(CURL *curl_h) {
+    if (curl_h == NULL) {
+        curl_h = curl_easy_init();
+    }
+
+    curl_easy_setopt(curl_h, CURLOPT_USERAGENT, "txiki.js/" "24" "." "12" "." "0" "");
+    curl_easy_setopt(curl_h, CURLOPT_FOLLOWLOCATION, 1L);
+    /* only allow HTTP */
+#if LIBCURL_VERSION_NUM >= 0x075500 /* added in 7.85.0 */
+    curl_easy_setopt(curl_h, CURLOPT_PROTOCOLS_STR, "http,https");
+    curl_easy_setopt(curl_h, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+#else
+    curl_easy_setopt(curl_h, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+    curl_easy_setopt(curl_h, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+#endif
+    /* use TLS v1.1 or higher */
+#if LIBCURL_VERSION_NUM >= 0x072200 /* added in 7.34.0 */
+    curl_easy_setopt(curl_h, CURLOPT_SSLVERSION, CURL_SSLVERSION_TLSv1_1);
+#endif
+
+    return curl_h;
+}
+
+size_t curl__write_cb(char *ptr, size_t size, size_t nmemb, void *userdata) {
+    size_t realsize = size * nmemb;
+    DynBuf *dbuf = userdata;
+    if (dbuf_put(dbuf, (const uint8_t *) ptr, realsize)) {
+        return -1;
+    }
+    return realsize;
+}
+
+int tjs_curl_load_http(DynBuf *dbuf, const char *url) {
+    CURL *curl_handle;
+    CURLcode res;
+    int r = -1;
+
+    /* init the curl session */
+    curl_handle = tjs__curl_easy_init(NULL);
+
+    /* specify URL to get */
+    curl_easy_setopt(curl_handle, CURLOPT_URL, url);
+
+    /* set a 5 second timeout */
+    curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT_MS, 5000);
+
+    /* send all data to this function  */
+    curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, curl__write_cb);
+
+    /* we pass our 'chunk' struct to the callback function */
+    curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *) dbuf);
+
+    /* get it! */
+    res = curl_easy_perform(curl_handle);
+
+    if (res == CURLE_OK) {
+        long code = 0;
+        res = curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &code);
+        if (res == CURLE_OK) {
+            r = (int) code;
+        }
+    }
+
+    if (res != CURLE_OK) {
+        r = -res;
+    }
+
+    /* cleanup curl stuff */
+    curl_easy_cleanup(curl_handle);
+
+    /* curl won't null terminate the memory, do it ourselves */
+    dbuf_putc(dbuf, '\0');
+
+    return r;
+}
+
+static void check_multi_info(JSThreadState *qrt) {
+    CURLMsg *message;
+    int pending;
+
+    while ((message = curl_multi_info_read(qrt->curlm_h, &pending))) {
+        switch (message->msg) {
+            case CURLMSG_DONE: {
+                /* Do not use message data after calling curl_multi_remove_handle() and
+                   curl_easy_cleanup(). As per curl_multi_info_read() docs:
+                   "WARNING: The data the returned pointer points to will not survive
+                   calling curl_multi_cleanup, curl_multi_remove_handle or
+                   curl_easy_cleanup." */
+                CURL *easy_handle = message->easy_handle;
+                //CHECK_NOT_NULL(easy_handle);
+
+                tjs_curl_private_t *curl_private = NULL;
+                curl_easy_getinfo(easy_handle, CURLINFO_PRIVATE, &curl_private);
+                //CHECK_NOT_NULL(curl_private);
+                /**
+                 * This is an ugly workaround. The WS code uses a _different_ private
+                 * struct and we need to tell them apart.
+                 */
+                if (curl_private->magic != TJS__CURL_PRIVATE_MAGIC) {
+                    break;
+                }
+                //CHECK_NOT_NULL(curl_private->done_cb);
+                curl_private->done_cb(message, curl_private->arg);
+
+                curl_multi_remove_handle(qrt->curlm_h, easy_handle);
+                curl_easy_cleanup(easy_handle);
+                break;
+            }
+            default:
+                abort();
+        }
+    }
+}
+
+static void event_poll_cb(int fd,uint8_t is_read,uint8_t is_write, void *arg)
+{
+    JSCURLRWHandler *poll_ctx = arg;
+
+    JSThreadState *qrt = poll_ctx->qrt;
+
+
+    int flags = 0;
+    {
+        if (is_read) {
+            flags |= CURL_CSELECT_IN;
+        }
+        if (is_write) {
+            flags |= CURL_CSELECT_OUT;
+        }
+    }
+
+    int running_handles;
+    curl_multi_socket_action(qrt->curlm_h, fd, flags, &running_handles);
+
+    check_multi_info(qrt);
+}
+
+static int curl__handle_socket(CURL *easy, curl_socket_t s, int action, void *userp, void *socketp) {
+
+    JSContext *ctx = userp;
+    JSThreadState *qrt = JS_GetRuntimeOpaque(JS_GetRuntime(ctx));
+    switch (action) {
+        case CURL_POLL_IN:
+        case CURL_POLL_OUT:
+        case CURL_POLL_INOUT: {
+            JSCURLRWHandler *poll_ctx;
+            if (!socketp) {
+                // Initialize poll handle.
+                poll_ctx = js_mallocz_rt(JS_GetRuntime(ctx), sizeof(*poll_ctx));
+                if (!poll_ctx) {
+                    return -1;
+                }
+                poll_ctx->is_read = 0;
+                poll_ctx->is_write = 0;
+                poll_ctx->qrt = qrt;
+                poll_ctx->fd = s;
+                poll_ctx->arg = poll_ctx;
+                poll_ctx->cb = event_poll_cb;
+                curl_multi_assign(qrt->curlm_h, s, (void *) poll_ctx);
+
+                if (action != CURL_POLL_IN) {
+                    poll_ctx->is_write = 1;
+                }
+                if (action != CURL_POLL_OUT) {
+                    poll_ctx->is_read = 1;
+                }
+
+                list_add_tail(&poll_ctx->link, &qrt->curl_events);
+            } else {
+                poll_ctx = socketp;
+                poll_ctx->is_read = 0;
+                poll_ctx->is_write = 0;
+                if (action != CURL_POLL_IN) {
+                     poll_ctx->is_write = 1;
+                }
+                if (action != CURL_POLL_OUT) {
+                    poll_ctx->is_read = 1;
+                }
+            }
+            break;
+        }
+        case CURL_POLL_REMOVE:
+            if (socketp) {
+                JSCURLRWHandler *poll_ctx = socketp;
+                curl_multi_assign(qrt->curlm_h, s, NULL);
+                list_del(&poll_ctx->link);
+                js_free_rt(JS_GetRuntime(ctx), poll_ctx);
+            }
+            break;
+        case CURL_POLL_NONE:
+            break;
+    }
+
+    return 0;
+}
+static JSValue uv_timer_cb(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv)
+{
+    JSThreadState *qrt = JS_GetRuntimeOpaque(JS_GetRuntime(ctx));
+    int running_handles;
+
+    CURLMcode ret = curl_multi_socket_action(qrt->curlm_h, CURL_SOCKET_TIMEOUT, 0, &running_handles);
+
+    check_multi_info(qrt);
+}
+
+static int curl__start_timeout(CURLM *multi, long timeout_ms, void *userp)
+{
+    JSContext *ctx = userp;
+    JSValueConst argv[2];
+
+    argv[0] = JS_NewCFunction(ctx, uv_timer_cb, "timer", 0);//
+    argv[1] = JS_NewInt64(ctx, timeout_ms);
+    JSValueConst this_val = JS_UNDEFINED;
+
+    JSValue v = js_os_setTimeout(ctx,this_val,2,argv);
+    JS_FreeValue(ctx, v);
+    JS_FreeValue(ctx, argv[0]);
+    JS_FreeValue(ctx, argv[1]);
+    return 0;
+}
+
+CURLM *tjs__get_curlm(JSContext *ctx) {
+    JSThreadState *qrt = JS_GetRuntimeOpaque(JS_GetRuntime(ctx));
+
+    if (!qrt->curlm_h) {
+        CURLM *curlm_h = curl_multi_init();
+        curl_multi_setopt(curlm_h, CURLMOPT_SOCKETFUNCTION, curl__handle_socket);
+        curl_multi_setopt(curlm_h, CURLMOPT_SOCKETDATA, ctx);
+        curl_multi_setopt(curlm_h, CURLMOPT_TIMERFUNCTION, curl__start_timeout);
+        curl_multi_setopt(curlm_h, CURLMOPT_TIMERDATA, ctx);
+        qrt->curlm_h = curlm_h;
+    }
+
+    return qrt->curlm_h;
 }
 
 void js_std_eval_binary_json_module(JSContext *ctx,
