@@ -1,11 +1,8 @@
 The main documentation is in doc/quickjs.pdf or doc/quickjs.html.
 
+中文说明请查看 README.md。
 
-
-
-移植了txiki.js的XMLHttpRequest的支持，所以对XMLHttpRequest支持程度就是和txiki.js一样
-由于实现是依赖libcurl需要安装一下
+移植了 txiki.js 的 XMLHttpRequest 支持，行为与 txiki.js 一致。
+依赖 libcurl，可安装：
 sudo apt-get install -y pkg-config libcurl4-openssl-dev
-编译后demo脚本在examples/test_xhr.js
-已经在ubuntu18.04.06上验证通过了
-由于很精简除开libcurl没有其它依赖，所以也兼容其它发行版Linux
+示例脚本：examples/test_xhr.js
